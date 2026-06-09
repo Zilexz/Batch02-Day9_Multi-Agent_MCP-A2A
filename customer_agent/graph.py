@@ -12,12 +12,11 @@ via a closure — these are bound per-request in agent_executor.py.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Annotated, Any, TypedDict
 
-from langchain_core.tools import tool
-from langgraph.prebuilt import create_react_agent
-
-from common.llm import get_llm
+from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +37,19 @@ Be professional, clear, and make the specialist response accessible to the user.
 """
 
 
+class CustomerState(TypedDict):
+    messages: Annotated[list, add_messages]
+
+
 def build_graph(trace_id: str, context_id: str, depth: int) -> Any:
-    """Build a create_react_agent graph with trace context bound into the tool closure.
+    """Build a minimal "delegate-and-return" graph.
+
+    LATENCY OPTIMISATION: the previous version used create_react_agent, which
+    needed TWO sequential LLM calls per request (one to decide to delegate, one
+    to re-present the answer). Since the Law Agent already returns a complete,
+    well-structured response, both of those LLM calls are pure overhead on the
+    critical path. This version delegates directly and returns the Law Agent's
+    answer verbatim — removing two slow LLM calls per request.
 
     Args:
         trace_id: UUID generated at this request's entry point.
@@ -47,27 +57,21 @@ def build_graph(trace_id: str, context_id: str, depth: int) -> Any:
         depth: Delegation depth (0 at customer agent).
 
     Returns:
-        A compiled LangGraph agent.
+        A compiled LangGraph graph exposing the {"messages": [...]} interface.
     """
 
-    @tool
-    async def delegate_to_legal_agent(question: str) -> str:
-        """Send a legal question to the Law Agent for comprehensive analysis.
-
-        The Law Agent will coordinate Tax and Compliance sub-agents in parallel
-        and return a synthesised response covering all relevant legal dimensions.
-
-        Args:
-            question: The legal question to analyse.
-
-        Returns:
-            A comprehensive legal analysis from the multi-agent system.
-        """
+    async def delegate_node(state: CustomerState) -> dict:
         from common.a2a_client import delegate
         from common.registry_client import discover
 
+        question = ""
+        for msg in reversed(state["messages"]):
+            if isinstance(msg, HumanMessage):
+                question = msg.content
+                break
+
         logger.info(
-            "Customer delegate_to_legal_agent | trace=%s context=%s depth=%d",
+            "Customer delegate (direct) | trace=%s context=%s depth=%d",
             trace_id, context_id, depth,
         )
 
@@ -81,16 +85,15 @@ def build_graph(trace_id: str, context_id: str, depth: int) -> Any:
                 depth=depth + 1,
             )
             if not result:
-                return "The Law Agent returned an empty response. Please try again."
-            return result
+                result = "The Law Agent returned an empty response. Please try again."
         except Exception as exc:
             logger.exception("delegate_to_legal_agent failed: %s", exc)
-            return f"Could not reach the Law Agent: {exc}"
+            result = f"Could not reach the Law Agent: {exc}"
 
-    llm = get_llm()
-    graph = create_react_agent(
-        model=llm,
-        tools=[delegate_to_legal_agent],
-        prompt=CUSTOMER_SYSTEM_PROMPT,
-    )
-    return graph
+        return {"messages": [AIMessage(content=result)]}
+
+    graph = StateGraph(CustomerState)
+    graph.add_node("delegate", delegate_node)
+    graph.add_edge(START, "delegate")
+    graph.add_edge("delegate", END)
+    return graph.compile()
